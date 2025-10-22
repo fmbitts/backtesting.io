@@ -3,7 +3,6 @@ import pandas as pd
 from backtesting import Backtest, Strategy
 from backtesting.lib import crossover, cross
 from backtesting.test import SMA
-import ta
 from import_tools import get_data_from_profit
 import multiprocessing
 import matplotlib as plt
@@ -25,7 +24,7 @@ print("Daily data shape:", data_daily.shape)
 def calculate_hilo_signal(data, n):
     """
     Calculate HiLo signals for a given timeframe
-    Returns: 1 for long, -1 for short, 0 for no signal
+    Returns: 1 for long, -1 for short, forward-filled to persist signals
     """
     sma_high = data['High'].rolling(window=n).mean()
     sma_low = data['Low'].rolling(window=n).mean()
@@ -34,6 +33,9 @@ def calculate_hilo_signal(data, n):
     signal = pd.Series(0, index=data.index)
     signal[data['Close'] > sma_high] = 1  # Long signal
     signal[data['Close'] < sma_low] = -1   # Short signal
+
+    # Forward fill to make signals persistent until reversed
+    signal = signal.replace(0, pd.NA).ffill().fillna(0)
 
     return signal
 
@@ -50,7 +52,7 @@ def prepare_combined_data(data_60min, data_daily, n_60=3, n_daily=3):
     # Merge daily signal into 60-minute data (forward fill to propagate daily signal)
     combined = data_60min.copy()
     combined = combined.join(daily_signal, how='left')
-    combined['Daily_Signal'] = combined['Daily_Signal'].fillna(method='ffill')
+    combined['Daily_Signal'] = combined['Daily_Signal'].ffill()
 
     return combined
 
@@ -63,10 +65,10 @@ print(milho_combined[['Close', 'Daily_Signal']].tail(20))
 #%%
 class MultiTimeframeHiLoStrategy(Strategy):
     """
-    Multi-timeframe HiLo Strategy
-    - Trades on 60-minute bars
-    - Requires confirmation from daily timeframe
-    - Position sizing: 1 contract for 60min + 2 contracts for daily = 3x when both agree
+    Independent Multi-timeframe HiLo Strategy
+    - 60-minute strategy trades independently (1 contract)
+    - Daily strategy trades independently (2 contracts)
+    - Combined position = sum of both (max 3 contracts in same direction)
     """
     n_60 = 3      # Period for 60-minute timeframe
     n_daily = 3   # Period for daily timeframe
@@ -81,43 +83,58 @@ class MultiTimeframeHiLoStrategy(Strategy):
         # Daily signal (already calculated and merged)
         self.daily_signal = self.data.Daily_Signal
 
+        # Track positions for each strategy independently
+        self.pos_60 = 0   # -1, 0, or 1
+        self.pos_daily = 0  # -2, 0, or 2
+
     def next(self):
         close = self.data.Close[-1]
 
-        # Get 60-minute signal
-        signal_60 = 0
+        # === 60-MINUTE STRATEGY (1 contract) ===
         if close > self.smahigh_60[-1]:
-            signal_60 = 1  # Long on 60min
+            self.pos_60 = 1  # Long 1 contract
         elif close < self.smalow_60[-1]:
-            signal_60 = -1  # Short on 60min
+            self.pos_60 = -1  # Short 1 contract
 
-        # Get daily signal
+        # === DAILY STRATEGY (2 contracts) ===
         daily_sig = self.daily_signal[-1]
+        if daily_sig == 1:
+            self.pos_daily = 2  # Long 2 contracts
+        elif daily_sig == -1:
+            self.pos_daily = -2  # Short 2 contracts
 
-        # Only trade when both timeframes agree
-        if signal_60 == 1 and daily_sig == 1:
-            # Both bullish: buy with 3x size (1 contract 60min + 2 contracts daily)
-            if self.position.is_short:
-                self.position.close()
-            if not self.position:
-                self.buy(size=3)
-            elif self.position.size < 3:
-                # Add to position if not at full size
-                self.buy(size=3 - self.position.size)
+        # === COMBINED POSITION ===
+        target_position = self.pos_60 + self.pos_daily
+        current_position = self.position.size if self.position else 0
 
-        elif signal_60 == -1 and daily_sig == -1:
-            # Both bearish: sell with 3x size
-            if self.position.is_long:
-                self.position.close()
-            if not self.position:
-                self.sell(size=3)
-            elif abs(self.position.size) < 3:
-                # Add to position if not at full size
-                self.sell(size=3 - abs(self.position.size))
+        # Adjust position to match target
+        if target_position != current_position:
+            if target_position > 0:
+                # Need to be long
+                if self.position.is_short:
+                    self.position.close()
+                if not self.position:
+                    self.buy(size=target_position)
+                elif self.position.size < target_position:
+                    self.buy(size=target_position - self.position.size)
+                elif self.position.size > target_position:
+                    self.sell(size=self.position.size - target_position)
 
-        # If signals conflict, close any existing position
-        elif self.position and signal_60 != 0 and daily_sig != 0 and signal_60 != daily_sig:
-            self.position.close()
+            elif target_position < 0:
+                # Need to be short
+                if self.position.is_long:
+                    self.position.close()
+                if not self.position:
+                    self.sell(size=abs(target_position))
+                elif abs(self.position.size) < abs(target_position):
+                    self.sell(size=abs(target_position) - abs(self.position.size))
+                elif abs(self.position.size) > abs(target_position):
+                    self.buy(size=abs(self.position.size) - abs(target_position))
+
+            else:
+                # Target is 0, close everything
+                if self.position:
+                    self.position.close()
 
 #%%
 # Run backtest
